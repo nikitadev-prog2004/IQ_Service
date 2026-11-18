@@ -1,0 +1,12 @@
+{
+  "name": "lumina-iq",
+  "private": true,
+  "type": "module",
+  "description": "Lumina — учебный MVP сервиса IQ-тестов с подпиской на отчёт.",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning --experimental-sqlite server.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}
