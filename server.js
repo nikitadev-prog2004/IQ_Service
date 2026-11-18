@@ -1,20 +1,19 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID, randomBytes } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
 import {
   publicQuestions,
   scoreAnswers,
   describe,
   findQuestion,
 } from "./questions.js";
+import * as db from "./db.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
-const dataDir = path.join(__dirname, "data");
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || "0.0.0.0";
 
@@ -27,73 +26,6 @@ const PLAN = {
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-mkdirSync(dataDir, { recursive: true });
-
-const db = new DatabaseSync(path.join(dataDir, "lumina.db"));
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    completed_at TEXT,
-    answers_json TEXT NOT NULL DEFAULT '{}',
-    earned INTEGER,
-    total INTEGER,
-    iq INTEGER,
-    percentile REAL,
-    band_json TEXT,
-    domains_json TEXT,
-    name TEXT,
-    email TEXT,
-    amount_rub INTEGER,
-    renewal_amount_rub INTEGER,
-    paid_at TEXT,
-    payment_status TEXT NOT NULL DEFAULT 'unpaid',
-    card_last4 TEXT,
-    transaction_id TEXT,
-    subscription_status TEXT,
-    renews_at TEXT,
-    cancelled_at TEXT
-  );
-`);
-
-const insertSession = db.prepare(
-  `INSERT INTO sessions (id, created_at, updated_at) VALUES (?, ?, ?)`
-);
-const selectSession = db.prepare(`SELECT * FROM sessions WHERE id = ?`);
-const saveAnswer = db.prepare(
-  `UPDATE sessions SET answers_json = ?, updated_at = ? WHERE id = ? AND completed_at IS NULL`
-);
-const saveResult = db.prepare(
-  `UPDATE sessions
-     SET completed_at = ?, updated_at = ?, earned = ?, total = ?, iq = ?,
-         percentile = ?, band_json = ?, domains_json = ?
-   WHERE id = ? AND completed_at IS NULL`
-);
-const savePayment = db.prepare(
-  `UPDATE sessions
-     SET name = ?, email = ?, amount_rub = ?, renewal_amount_rub = ?,
-         paid_at = ?, payment_status = 'paid', card_last4 = ?, transaction_id = ?,
-         subscription_status = 'trial', renews_at = ?, updated_at = ?
-   WHERE id = ? AND payment_status = 'unpaid' AND completed_at IS NOT NULL`
-);
-const cancelSub = db.prepare(
-  `UPDATE sessions
-     SET subscription_status = 'cancelled', cancelled_at = ?, updated_at = ?
-   WHERE id = ? AND payment_status = 'paid' AND subscription_status = 'trial'`
-);
-
-let chain = Promise.resolve();
-function serial(fn) {
-  const run = chain.then(fn, fn);
-  chain = run.then(
-    () => {},
-    () => {}
-  );
-  return run;
-}
 
 const hits = new Map();
 function limited(ip) {
@@ -108,14 +40,19 @@ function limited(ip) {
   return false;
 }
 
+function storedJson(value, fallback) {
+  if (value == null || value === "") return fallback;
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
 function present(row) {
   if (!row) return null;
-  let answers = {};
-  try {
-    answers = JSON.parse(row.answers_json || "{}");
-  } catch {
-    answers = {};
-  }
+  const answers = storedJson(row.answers_json, {});
   const paid = row.payment_status === "paid";
   return {
     id: row.id,
@@ -124,7 +61,7 @@ function present(row) {
     completed: Boolean(row.completed_at),
     paid,
     answers,
-    teaser: row.band_json ? JSON.parse(row.band_json) : null,
+    teaser: storedJson(row.band_json, null),
     payment: paid
       ? {
           amount: row.amount_rub,
@@ -141,10 +78,10 @@ function present(row) {
 }
 
 function presentResult(row) {
-  const answers = JSON.parse(row.answers_json || "{}");
+  const answers = storedJson(row.answers_json, {});
   const scored = scoreAnswers(answers);
-  const band = JSON.parse(row.band_json);
-  const domains = JSON.parse(row.domains_json);
+  const band = storedJson(row.band_json, {});
+  const domains = storedJson(row.domains_json, []);
   const durationSec = Math.max(
     1,
     Math.round((Date.parse(row.completed_at) - Date.parse(row.created_at)) / 1000)
@@ -252,7 +189,16 @@ async function handleApi(req, res, url) {
   const parts = url.pathname.split("/").filter(Boolean);
 
   if (req.method === "GET" && url.pathname === "/api/health") {
-    send(res, 200, { ok: true });
+    try {
+      await db.ping();
+      send(res, 200, { ok: true, db: "postgres" });
+    } catch (error) {
+      const status = error.status || 503;
+      send(res, status, {
+        ok: false,
+        error: error.message || "База данных недоступна. Проверьте DATABASE_URL.",
+      });
+    }
     return;
   }
 
@@ -262,12 +208,8 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/session") {
-    const row = await serial(async () => {
-      const id = randomUUID();
-      const now = new Date().toISOString();
-      insertSession.run(id, now, now);
-      return selectSession.get(id);
-    });
+    const id = randomUUID();
+    const row = await db.createSession(id, new Date().toISOString());
     send(res, 201, present(row));
     return;
   }
@@ -282,7 +224,7 @@ async function handleApi(req, res, url) {
 
   const id = parts[2];
   const action = parts[3] || "";
-  const row = selectSession.get(id);
+  const row = await db.getSession(id);
   if (!row) {
     send(res, 404, { error: "Сессия не найдена. Начните тест заново." });
     return;
@@ -309,50 +251,17 @@ async function handleApi(req, res, url) {
       send(res, 400, { error: "Такого варианта нет." });
       return;
     }
-    const updated = await serial(async () => {
-      const fresh = selectSession.get(id);
-      if (!fresh) return { status: 404, error: "Сессия не найдена." };
-      if (fresh.completed_at) return { status: 409, error: "Тест уже отправлен, ответы закрыты." };
-      const answers = JSON.parse(fresh.answers_json || "{}");
-      answers[question.id] = body.optionId;
-      const info = saveAnswer.run(JSON.stringify(answers), new Date().toISOString(), id);
-      if (!info.changes) return { status: 409, error: "Тест уже отправлен, ответы закрыты." };
-      return { status: 200, session: present(selectSession.get(id)) };
-    });
-    send(res, updated.status, updated.session || { error: updated.error });
+    const updated = await db.saveAnswer(id, question.id, body.optionId);
+    send(res, updated.status, updated.row ? present(updated.row) : { error: updated.error });
     return;
   }
 
   if (req.method === "POST" && action === "complete") {
-    const updated = await serial(async () => {
-      const fresh = selectSession.get(id);
-      if (!fresh) return { status: 404, error: "Сессия не найдена." };
-      if (fresh.completed_at) return { status: 200, session: present(fresh) };
-      const answers = JSON.parse(fresh.answers_json || "{}");
-      const missing = publicQuestions().some((q) => !answers[q.id]);
-      if (missing) return { status: 400, error: "Сначала ответьте на все 12 вопросов." };
-      const scored = scoreAnswers(answers);
-      const now = new Date().toISOString();
-      const band = {
-        key: scored.band.key,
-        title: scored.band.title,
-        detail: scored.band.detail,
-      };
-      const info = saveResult.run(
-        now,
-        now,
-        scored.earned,
-        scored.total,
-        scored.iq,
-        scored.percentile,
-        JSON.stringify(band),
-        JSON.stringify(scored.domains),
-        id
-      );
-      if (!info.changes) return { status: 200, session: present(selectSession.get(id)) };
-      return { status: 200, session: present(selectSession.get(id)) };
+    const updated = await db.completeSession(id, (answers) => {
+      if (publicQuestions().some((question) => !answers[question.id])) return null;
+      return scoreAnswers(answers);
     });
-    send(res, updated.status, updated.session || { error: updated.error });
+    send(res, updated.status, updated.row ? present(updated.row) : { error: updated.error });
     return;
   }
 
@@ -367,7 +276,7 @@ async function handleApi(req, res, url) {
       return;
     }
     if (row.payment_status === "paid") {
-      send(res, 200, { alreadyPaid: true, ...present(selectSession.get(id)) });
+      send(res, 200, { alreadyPaid: true, ...present(row) });
       return;
     }
 
@@ -401,37 +310,21 @@ async function handleApi(req, res, url) {
     }
 
     const last4 = card.slice(-4);
-    const paid = await serial(async () => {
-      const fresh = selectSession.get(id);
-      if (!fresh) return { status: 404, error: "Сессия не найдена." };
-      if (fresh.payment_status === "paid") {
-        return { status: 200, session: { alreadyPaid: true, ...present(fresh) } };
-      }
-      const now = new Date();
-      const renews = new Date(now.getTime() + PLAN.trialDays * 24 * 60 * 60 * 1000);
-      const tx = `LUM-${randomBytes(4).toString("hex").toUpperCase()}`;
-      const info = savePayment.run(
-        name,
-        email,
-        PLAN.amount,
-        PLAN.renewalAmount,
-        now.toISOString(),
-        last4,
-        tx,
-        renews.toISOString(),
-        now.toISOString(),
-        id
-      );
-      if (!info.changes) {
-        const again = selectSession.get(id);
-        if (again?.payment_status === "paid") {
-          return { status: 200, session: { alreadyPaid: true, ...present(again) } };
-        }
-        return { status: 409, error: "Оплата не прошла. Завершите тест и попробуйте ещё раз." };
-      }
-      return { status: 200, session: present(selectSession.get(id)) };
+    const renews = new Date(Date.now() + PLAN.trialDays * 24 * 60 * 60 * 1000);
+    const paid = await db.savePayment(id, {
+      name,
+      email,
+      amount: PLAN.amount,
+      renewalAmount: PLAN.renewalAmount,
+      last4,
+      transactionId: `LUM-${randomBytes(4).toString("hex").toUpperCase()}`,
+      renewsAt: renews.toISOString(),
     });
-    send(res, paid.status, paid.session || { error: paid.error });
+    if (paid.row && paid.alreadyPaid) {
+      send(res, paid.status, { alreadyPaid: true, ...present(paid.row) });
+      return;
+    }
+    send(res, paid.status, paid.row ? present(paid.row) : { error: paid.error });
     return;
   }
 
@@ -440,11 +333,12 @@ async function handleApi(req, res, url) {
       send(res, 402, { error: "Отменять пока нечего: отчёт не оплачен." });
       return;
     }
-    await serial(async () => {
-      const now = new Date().toISOString();
-      cancelSub.run(now, now, id);
-    });
-    send(res, 200, present(selectSession.get(id)));
+    const updated = await db.cancelSubscription(id);
+    if (!updated) {
+      send(res, 404, { error: "Сессия не найдена. Начните тест заново." });
+      return;
+    }
+    send(res, 200, present(updated));
     return;
   }
 
@@ -504,5 +398,8 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`Lumina IQ → http://localhost:${PORT}`);
+  const storage = db.databaseConfigured ? "PostgreSQL" : "DATABASE_URL не задан";
+  console.log(`Lumina IQ → http://localhost:${PORT} (${storage})`);
 });
+
+export default server;
