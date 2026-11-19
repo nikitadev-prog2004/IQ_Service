@@ -383,13 +383,15 @@ const server = createServer(async (req, res) => {
   }
 });
 
+export default server;
+
 function isDirectRun() {
   const entry = process.argv[1];
   if (!entry) return false;
   return path.resolve(entry).toLowerCase() === path.resolve(fileURLToPath(import.meta.url)).toLowerCase();
 }
 
-if (isDirectRun()) {
+if (process.env.VERCEL !== "1" && isDirectRun()) {
   server.on("error", (error) => {
     if (error.code === "EADDRINUSE") {
       console.error(`Порт ${PORT} уже занят. Остановите другой процесс или задайте другой PORT.`);

@@ -12,7 +12,7 @@ npm run migrate
 npm start
 ```
 
-`npm start` поднимает локальный сервер. На Vercel он не является точкой входа: платформа вызывает `api/index.js`.
+`npm start` локально вызывает `server.listen`. На Vercel слушатель порта не запускается: платформа берёт `export default` из `server.js`, это готовый `node:http` сервер. Запросы `/api/*` дополнительно попадают в `api/index.js`.
 
 Откройте http://localhost:3000
 
@@ -59,7 +59,7 @@ vercel --prod
 
 ## Стек
 
-`node:http` локально и одна Vercel Function `api/index.js` в проде. База — клиент `postgres` и `DATABASE_URL`. Интерфейс — одна страница, сначала мобильная ширина. Сессия в браузере — только UUID. Ответы, результат и учебная оплата лежат в PostgreSQL и привязаны к этому UUID.
+`node:http`: локально через `npm start`, на Vercel через `export default` сервера из `server.js`. База — клиент `postgres` и `DATABASE_URL`. Интерфейс — одна страница, сначала мобильная ширина. Сессия в браузере — только UUID. Ответы, результат и учебная оплата лежат в PostgreSQL и привязаны к этому UUID.
 
 ## API
 

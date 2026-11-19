@@ -4,6 +4,10 @@
     { "source": "/api/(.*)", "destination": "/api" }
   ],
   "functions": {
+    "server.js": {
+      "maxDuration": 15,
+      "includeFiles": "migrations/**"
+    },
     "api/index.js": {
       "maxDuration": 15,
       "includeFiles": "migrations/**"
