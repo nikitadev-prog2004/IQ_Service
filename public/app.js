@@ -414,6 +414,7 @@ function viewHome() {
             }, "Сколько стоит")
           ),
           continueLine,
+          state.homeError ? el("p", { class: "form-error" }, state.homeError) : null,
           state.session?.completed
             ? el("button", { class: "text-btn", type: "button", onclick: startNew, style: "margin-top:10px" }, "Пройти заново")
             : el("p", { class: "fine" }, `7 дней доступа — ${rub(149)}, дальше ${rub(399)} в месяц`)

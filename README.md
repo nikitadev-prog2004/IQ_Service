@@ -12,7 +12,7 @@ npm run migrate
 npm start
 ```
 
-`npm start` локально вызывает `server.listen`. На Vercel слушатель порта не запускается: платформа берёт `export default` из `server.js`, это готовый `node:http` сервер. Запросы `/api/*` дополнительно попадают в `api/index.js`.
+`npm start` локально вызывает `server.listen`. На Vercel слушатель порта не запускается: платформа берёт `export default` из `server.js` и передаёт ему исходный путь, включая `/api/session`.
 
 Откройте http://localhost:3000
 

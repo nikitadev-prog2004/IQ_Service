@@ -158,13 +158,29 @@ export function parseJsonBody(text) {
 }
 
 function readBody(req) {
+  if (req.body && typeof req.body === "object" && !Buffer.isBuffer(req.body)) {
+    return Promise.resolve(req.body);
+  }
+  if (typeof req.body === "string") return Promise.resolve(parseJsonBody(req.body));
+  if (req.readableEnded) return Promise.resolve({});
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    const timer = setTimeout(() => {
+      reject(Object.assign(new Error("Не удалось прочитать запрос"), { status: 400 }));
+    }, 8000);
+    const fail = (error) => {
+      clearTimeout(timer);
+      reject(error);
+    };
+    const done = (value) => {
+      clearTimeout(timer);
+      resolve(value);
+    };
     req.on("data", (chunk) => {
       size += chunk.length;
       if (size > 32_000) {
-        reject(Object.assign(new Error("Слишком большой запрос"), { status: 413 }));
+        fail(Object.assign(new Error("Слишком большой запрос"), { status: 413 }));
         req.destroy();
         return;
       }
@@ -172,12 +188,12 @@ function readBody(req) {
     });
     req.on("end", () => {
       try {
-        resolve(parseJsonBody(Buffer.concat(chunks).toString("utf8")));
+        done(parseJsonBody(Buffer.concat(chunks).toString("utf8")));
       } catch (error) {
-        reject(error);
+        fail(error);
       }
     });
-    req.on("error", reject);
+    req.on("error", fail);
   });
 }
 
@@ -360,7 +376,7 @@ function clientFailure(error) {
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-    if (url.pathname.startsWith("/api/")) {
+    if (url.pathname.startsWith("/api/") || url.pathname === "/api") {
       let body;
       if (req.method !== "GET" && req.method !== "HEAD") body = await readBody(req);
       const result = await handleApiRequest({
