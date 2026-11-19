@@ -1,20 +1,14 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID, randomBytes } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
-import {
-  publicQuestions,
-  scoreAnswers,
-  describe,
-  findQuestion,
-} from "./questions.js";
+import { publicQuestions, scoreAnswers, describe, findQuestion } from "./questions.js";
+import * as db from "./db.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
-const dataDir = path.join(__dirname, "data");
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || "0.0.0.0";
 
@@ -27,73 +21,6 @@ const PLAN = {
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-mkdirSync(dataDir, { recursive: true });
-
-const db = new DatabaseSync(path.join(dataDir, "lumina.db"));
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    completed_at TEXT,
-    answers_json TEXT NOT NULL DEFAULT '{}',
-    earned INTEGER,
-    total INTEGER,
-    iq INTEGER,
-    percentile REAL,
-    band_json TEXT,
-    domains_json TEXT,
-    name TEXT,
-    email TEXT,
-    amount_rub INTEGER,
-    renewal_amount_rub INTEGER,
-    paid_at TEXT,
-    payment_status TEXT NOT NULL DEFAULT 'unpaid',
-    card_last4 TEXT,
-    transaction_id TEXT,
-    subscription_status TEXT,
-    renews_at TEXT,
-    cancelled_at TEXT
-  );
-`);
-
-const insertSession = db.prepare(
-  `INSERT INTO sessions (id, created_at, updated_at) VALUES (?, ?, ?)`
-);
-const selectSession = db.prepare(`SELECT * FROM sessions WHERE id = ?`);
-const saveAnswer = db.prepare(
-  `UPDATE sessions SET answers_json = ?, updated_at = ? WHERE id = ? AND completed_at IS NULL`
-);
-const saveResult = db.prepare(
-  `UPDATE sessions
-     SET completed_at = ?, updated_at = ?, earned = ?, total = ?, iq = ?,
-         percentile = ?, band_json = ?, domains_json = ?
-   WHERE id = ? AND completed_at IS NULL`
-);
-const savePayment = db.prepare(
-  `UPDATE sessions
-     SET name = ?, email = ?, amount_rub = ?, renewal_amount_rub = ?,
-         paid_at = ?, payment_status = 'paid', card_last4 = ?, transaction_id = ?,
-         subscription_status = 'trial', renews_at = ?, updated_at = ?
-   WHERE id = ? AND payment_status = 'unpaid' AND completed_at IS NOT NULL`
-);
-const cancelSub = db.prepare(
-  `UPDATE sessions
-     SET subscription_status = 'cancelled', cancelled_at = ?, updated_at = ?
-   WHERE id = ? AND payment_status = 'paid' AND subscription_status = 'trial'`
-);
-
-let chain = Promise.resolve();
-function serial(fn) {
-  const run = chain.then(fn, fn);
-  chain = run.then(
-    () => {},
-    () => {}
-  );
-  return run;
-}
 
 const hits = new Map();
 function limited(ip) {
@@ -108,15 +35,21 @@ function limited(ip) {
   return false;
 }
 
+function asJson(value, fallback) {
+  if (value == null) return fallback;
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
 function present(row) {
   if (!row) return null;
-  let answers = {};
-  try {
-    answers = JSON.parse(row.answers_json || "{}");
-  } catch {
-    answers = {};
-  }
+  const answers = asJson(row.answers_json, {});
   const paid = row.payment_status === "paid";
+  const band = asJson(row.band_json, null);
   return {
     id: row.id,
     createdAt: row.created_at,
@@ -124,7 +57,7 @@ function present(row) {
     completed: Boolean(row.completed_at),
     paid,
     answers,
-    teaser: row.band_json ? JSON.parse(row.band_json) : null,
+    teaser: band,
     payment: paid
       ? {
           amount: row.amount_rub,
@@ -141,10 +74,10 @@ function present(row) {
 }
 
 function presentResult(row) {
-  const answers = JSON.parse(row.answers_json || "{}");
+  const answers = asJson(row.answers_json, {});
   const scored = scoreAnswers(answers);
-  const band = JSON.parse(row.band_json);
-  const domains = JSON.parse(row.domains_json);
+  const band = asJson(row.band_json, null);
+  const domains = asJson(row.domains_json, []);
   const durationSec = Math.max(
     1,
     Math.round((Date.parse(row.completed_at) - Date.parse(row.created_at)) / 1000)
@@ -200,16 +133,28 @@ function validEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) && email.length <= 120;
 }
 
-function send(res, status, data) {
-  const body = JSON.stringify(data);
-  res.writeHead(status, {
-    "Content-Type": "application/json; charset=utf-8",
-    "Content-Length": Buffer.byteLength(body),
-    "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
-  });
-  res.end(body);
+export function parseJsonBody(text) {
+  const raw = String(text || "");
+  if (Buffer.byteLength(raw) > 32_000) {
+    const error = new Error("Слишком большой запрос");
+    error.status = 413;
+    throw error;
+  }
+  if (!raw.trim()) return {};
+  try {
+    const value = JSON.parse(raw);
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      const error = new Error("Не удалось прочитать запрос");
+      error.status = 400;
+      throw error;
+    }
+    return value;
+  } catch (error) {
+    if (error.status) throw error;
+    const wrapped = new Error("Не удалось прочитать запрос");
+    wrapped.status = 400;
+    throw wrapped;
+  }
 }
 
 function readBody(req) {
@@ -226,14 +171,10 @@ function readBody(req) {
       chunks.push(chunk);
     });
     req.on("end", () => {
-      if (!chunks.length) {
-        resolve({});
-        return;
-      }
       try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-      } catch {
-        reject(Object.assign(new Error("Не удалось прочитать запрос"), { status: 400 }));
+        resolve(parseJsonBody(Buffer.concat(chunks).toString("utf8")));
+      } catch (error) {
+        reject(error);
       }
     });
     req.on("error", reject);
@@ -248,207 +189,131 @@ function clientIp(req) {
   return req.socket.remoteAddress || "local";
 }
 
-async function handleApi(req, res, url) {
+function reply(status, data) {
+  return { status, data };
+}
+
+export async function handleApiRequest({ method, url, body, ip }) {
   const parts = url.pathname.split("/").filter(Boolean);
 
-  if (req.method === "GET" && url.pathname === "/api/health") {
-    send(res, 200, { ok: true });
-    return;
+  if (method === "GET" && url.pathname === "/api/health") {
+    await db.ping();
+    return reply(200, { ok: true });
   }
 
-  if (req.method === "GET" && url.pathname === "/api/questions") {
-    send(res, 200, { questions: publicQuestions() });
-    return;
+  if (method === "GET" && url.pathname === "/api/questions") {
+    return reply(200, { questions: publicQuestions() });
   }
 
-  if (req.method === "POST" && url.pathname === "/api/session") {
-    const row = await serial(async () => {
-      const id = randomUUID();
-      const now = new Date().toISOString();
-      insertSession.run(id, now, now);
-      return selectSession.get(id);
-    });
-    send(res, 201, present(row));
-    return;
+  if (method === "POST" && url.pathname === "/api/session") {
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    const row = await db.createSession(id, now);
+    return reply(201, present(row));
   }
 
-  const sessionMatch =
-    parts[0] === "api" && parts[1] === "session" && parts[2] && UUID_RE.test(parts[2]);
-
-  if (!sessionMatch) {
-    send(res, 404, { error: "Такого адреса нет" });
-    return;
-  }
+  const sessionMatch = parts[0] === "api" && parts[1] === "session" && parts[2] && UUID_RE.test(parts[2]);
+  if (!sessionMatch) return reply(404, { error: "Такого адреса нет" });
 
   const id = parts[2];
   const action = parts[3] || "";
-  const row = selectSession.get(id);
-  if (!row) {
-    send(res, 404, { error: "Сессия не найдена. Начните тест заново." });
-    return;
+  const row = await db.getSession(id);
+  if (!row) return reply(404, { error: "Сессия не найдена. Начните тест заново." });
+
+  if (method === "GET" && !action) return reply(200, present(row));
+
+  if (method === "GET" && action === "result") {
+    if (row.payment_status !== "paid") return reply(402, { error: "Отчёт откроется после оплаты." });
+    return reply(200, presentResult(row));
   }
 
-  if (req.method === "GET" && !action) {
-    send(res, 200, present(row));
-    return;
+  if (method === "POST" && action === "answer") {
+    const question = findQuestion(body?.questionId);
+    if (!question || !question.options.some((option) => option.id === body?.optionId)) {
+      return reply(400, { error: "Такого варианта нет." });
+    }
+    const saved = await db.saveAnswer(id, question.id, body.optionId, new Date().toISOString());
+    if (saved.code === "missing") return reply(404, { error: "Сессия не найдена." });
+    if (saved.code === "closed") return reply(409, { error: "Тест уже отправлен, ответы закрыты." });
+    return reply(200, present(saved.row));
   }
 
-  if (req.method === "GET" && action === "result") {
-    if (row.payment_status !== "paid") {
-      send(res, 402, { error: "Отчёт откроется после оплаты." });
-      return;
-    }
-    send(res, 200, presentResult(row));
-    return;
+  if (method === "POST" && action === "complete") {
+    const finished = await db.completeSession(
+      id,
+      publicQuestions().map((question) => question.id),
+      new Date().toISOString(),
+      scoreAnswers
+    );
+    if (finished.code === "missing") return reply(404, { error: "Сессия не найдена." });
+    if (finished.code === "incomplete") return reply(400, { error: "Сначала ответьте на все 12 вопросов." });
+    return reply(200, present(finished.row));
   }
 
-  if (req.method === "POST" && action === "answer") {
-    const body = await readBody(req);
-    const question = findQuestion(body.questionId);
-    if (!question || !question.options.some((o) => o.id === body.optionId)) {
-      send(res, 400, { error: "Такого варианта нет." });
-      return;
-    }
-    const updated = await serial(async () => {
-      const fresh = selectSession.get(id);
-      if (!fresh) return { status: 404, error: "Сессия не найдена." };
-      if (fresh.completed_at) return { status: 409, error: "Тест уже отправлен, ответы закрыты." };
-      const answers = JSON.parse(fresh.answers_json || "{}");
-      answers[question.id] = body.optionId;
-      const info = saveAnswer.run(JSON.stringify(answers), new Date().toISOString(), id);
-      if (!info.changes) return { status: 409, error: "Тест уже отправлен, ответы закрыты." };
-      return { status: 200, session: present(selectSession.get(id)) };
-    });
-    send(res, updated.status, updated.session || { error: updated.error });
-    return;
-  }
+  if (method === "POST" && action === "checkout") {
+    if (limited(ip || "local")) return reply(429, { error: "Слишком много попыток. Подождите минуту." });
+    if (!row.completed_at) return reply(409, { error: "Сначала завершите тест." });
+    if (row.payment_status === "paid") return reply(200, { alreadyPaid: true, ...present(row) });
 
-  if (req.method === "POST" && action === "complete") {
-    const updated = await serial(async () => {
-      const fresh = selectSession.get(id);
-      if (!fresh) return { status: 404, error: "Сессия не найдена." };
-      if (fresh.completed_at) return { status: 200, session: present(fresh) };
-      const answers = JSON.parse(fresh.answers_json || "{}");
-      const missing = publicQuestions().some((q) => !answers[q.id]);
-      if (missing) return { status: 400, error: "Сначала ответьте на все 12 вопросов." };
-      const scored = scoreAnswers(answers);
-      const now = new Date().toISOString();
-      const band = {
-        key: scored.band.key,
-        title: scored.band.title,
-        detail: scored.band.detail,
-      };
-      const info = saveResult.run(
-        now,
-        now,
-        scored.earned,
-        scored.total,
-        scored.iq,
-        scored.percentile,
-        JSON.stringify(band),
-        JSON.stringify(scored.domains),
-        id
-      );
-      if (!info.changes) return { status: 200, session: present(selectSession.get(id)) };
-      return { status: 200, session: present(selectSession.get(id)) };
-    });
-    send(res, updated.status, updated.session || { error: updated.error });
-    return;
-  }
+    const name = cleanName(body?.name);
+    const email = String(body?.email || "").trim().toLowerCase();
+    const card = String(body?.card || "").replace(/\D/g, "");
+    const expiry = String(body?.expiry || "");
+    const cvc = String(body?.cvc || "").trim();
 
-  if (req.method === "POST" && action === "checkout") {
-    if (limited(clientIp(req))) {
-      send(res, 429, { error: "Слишком много попыток. Подождите минуту." });
-      return;
-    }
-    const body = await readBody(req);
-    if (!row.completed_at) {
-      send(res, 409, { error: "Сначала завершите тест." });
-      return;
-    }
-    if (row.payment_status === "paid") {
-      send(res, 200, { alreadyPaid: true, ...present(selectSession.get(id)) });
-      return;
-    }
-
-    const name = cleanName(body.name);
-    const email = String(body.email || "").trim().toLowerCase();
-    const card = String(body.card || "").replace(/\D/g, "");
-    const expiry = String(body.expiry || "");
-    const cvc = String(body.cvc || "").trim();
-
-    if (!validName(name)) {
-      send(res, 400, { error: "Введите имя, как его подписать в отчёте." });
-      return;
-    }
-    if (!validEmail(email)) {
-      send(res, 400, { error: "Нужна почта в формате name@site.ru." });
-      return;
-    }
+    if (!validName(name)) return reply(400, { error: "Введите имя, как его подписать в отчёте." });
+    if (!validEmail(email)) return reply(400, { error: "Нужна почта в формате name@site.ru." });
     if (!luhn(card)) {
-      send(res, 400, {
+      return reply(400, {
         error: "Номер карты не проходит проверку. Для демо подойдёт 4242 4242 4242 4242.",
       });
-      return;
     }
     if (!expiryOk(expiry)) {
-      send(res, 400, { error: "Срок карты уже прошёл или записан не так. Пример: 12/30." });
-      return;
+      return reply(400, { error: "Срок карты уже прошёл или записан не так. Пример: 12/30." });
     }
     if (!/^\d{3}$/.test(cvc)) {
-      send(res, 400, { error: "CVC — это три цифры. Для демо подойдут любые, например 123." });
-      return;
+      return reply(400, { error: "CVC — это три цифры. Для демо подойдут любые, например 123." });
     }
 
-    const last4 = card.slice(-4);
-    const paid = await serial(async () => {
-      const fresh = selectSession.get(id);
-      if (!fresh) return { status: 404, error: "Сессия не найдена." };
-      if (fresh.payment_status === "paid") {
-        return { status: 200, session: { alreadyPaid: true, ...present(fresh) } };
-      }
-      const now = new Date();
-      const renews = new Date(now.getTime() + PLAN.trialDays * 24 * 60 * 60 * 1000);
-      const tx = `LUM-${randomBytes(4).toString("hex").toUpperCase()}`;
-      const info = savePayment.run(
-        name,
-        email,
-        PLAN.amount,
-        PLAN.renewalAmount,
-        now.toISOString(),
-        last4,
-        tx,
-        renews.toISOString(),
-        now.toISOString(),
-        id
-      );
-      if (!info.changes) {
-        const again = selectSession.get(id);
-        if (again?.payment_status === "paid") {
-          return { status: 200, session: { alreadyPaid: true, ...present(again) } };
-        }
-        return { status: 409, error: "Оплата не прошла. Завершите тест и попробуйте ещё раз." };
-      }
-      return { status: 200, session: present(selectSession.get(id)) };
+    const now = new Date();
+    const renews = new Date(now.getTime() + PLAN.trialDays * 24 * 60 * 60 * 1000);
+    const paid = await db.recordPayment(id, {
+      name,
+      email,
+      amount: PLAN.amount,
+      renewalAmount: PLAN.renewalAmount,
+      paidAt: now.toISOString(),
+      renewsAt: renews.toISOString(),
+      last4: card.slice(-4),
+      transactionId: `LUM-${randomBytes(4).toString("hex").toUpperCase()}`,
     });
-    send(res, paid.status, paid.session || { error: paid.error });
-    return;
+    if (paid.code === "missing") return reply(404, { error: "Сессия не найдена." });
+    if (paid.code === "open") return reply(409, { error: "Оплата не прошла. Завершите тест и попробуйте ещё раз." });
+    if (paid.code === "paid") return reply(200, { alreadyPaid: true, ...present(paid.row) });
+    return reply(200, present(paid.row));
   }
 
-  if (req.method === "POST" && action === "cancel") {
-    if (row.payment_status !== "paid") {
-      send(res, 402, { error: "Отменять пока нечего: отчёт не оплачен." });
-      return;
-    }
-    await serial(async () => {
-      const now = new Date().toISOString();
-      cancelSub.run(now, now, id);
-    });
-    send(res, 200, present(selectSession.get(id)));
-    return;
+  if (method === "POST" && action === "cancel") {
+    if (row.payment_status !== "paid") return reply(402, { error: "Отменять пока нечего: отчёт не оплачен." });
+    const cancelled = await db.cancelRenewal(id, new Date().toISOString());
+    if (cancelled.code === "missing") return reply(404, { error: "Сессия не найдена." });
+    if (cancelled.code === "unpaid") return reply(402, { error: "Отменять пока нечего: отчёт не оплачен." });
+    return reply(200, present(cancelled.row));
   }
 
-  send(res, 404, { error: "Такого адреса нет" });
+  return reply(404, { error: "Такого адреса нет" });
+}
+
+function send(res, status, data) {
+  const payload = JSON.stringify(data);
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": Buffer.byteLength(payload),
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+  });
+  res.end(payload);
 }
 
 const TYPES = {
@@ -464,8 +329,9 @@ async function handleStatic(res, urlPath) {
     send(res, 400, { error: "Плохой адрес" });
     return;
   }
-  const full = path.normalize(path.join(publicDir, rel));
-  if (!full.startsWith(publicDir)) {
+  const full = path.resolve(publicDir, rel);
+  const root = path.resolve(publicDir);
+  if (full !== root && !full.startsWith(root + path.sep)) {
     send(res, 403, { error: "Доступ закрыт" });
     return;
   }
@@ -484,11 +350,26 @@ async function handleStatic(res, urlPath) {
   res.end(body);
 }
 
+function clientFailure(error) {
+  if (error?.publicMessage) return { status: error.status || 503, error: error.publicMessage };
+  if (error?.status && error.status < 500) return { status: error.status, error: error.message };
+  console.error(db.redact(error));
+  return { status: 500, error: "Сбой сервера" };
+}
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     if (url.pathname.startsWith("/api/")) {
-      await handleApi(req, res, url);
+      let body;
+      if (req.method !== "GET" && req.method !== "HEAD") body = await readBody(req);
+      const result = await handleApiRequest({
+        method: req.method || "GET",
+        url,
+        body,
+        ip: clientIp(req),
+      });
+      send(res, result.status, result.data);
       return;
     }
     if (req.method !== "GET" && req.method !== "HEAD") {
@@ -497,12 +378,27 @@ const server = createServer(async (req, res) => {
     }
     await handleStatic(res, url.pathname);
   } catch (error) {
-    const status = error.status || 500;
-    if (status === 500) console.error(error);
-    if (!res.headersSent) send(res, status, { error: error.status ? error.message : "Сбой сервера" });
+    const failure = clientFailure(error);
+    if (!res.headersSent) send(res, failure.status, { error: failure.error });
   }
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Lumina IQ → http://localhost:${PORT}`);
-});
+function isDirectRun() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  return path.resolve(entry).toLowerCase() === path.resolve(fileURLToPath(import.meta.url)).toLowerCase();
+}
+
+if (isDirectRun()) {
+  server.on("error", (error) => {
+    if (error.code === "EADDRINUSE") {
+      console.error(`Порт ${PORT} уже занят. Остановите другой процесс или задайте другой PORT.`);
+      process.exit(1);
+    }
+    console.error(db.redact(error));
+    process.exit(1);
+  });
+  server.listen(PORT, HOST, () => {
+    console.log(`Lumina IQ → http://localhost:${PORT}`);
+  });
+}

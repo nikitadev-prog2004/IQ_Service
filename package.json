@@ -4,9 +4,13 @@
   "type": "module",
   "description": "Lumina — учебный MVP сервиса IQ-тестов с подпиской на отчёт.",
   "scripts": {
-    "start": "node --disable-warning=ExperimentalWarning --experimental-sqlite server.js"
+    "start": "node --env-file-if-exists=.env server.js",
+    "migrate": "node --env-file-if-exists=.env scripts/migrate.js"
   },
   "engines": {
-    "node": ">=22.13"
+    "node": "22.x"
+  },
+  "dependencies": {
+    "postgres": "^3.4.9"
   }
 }
